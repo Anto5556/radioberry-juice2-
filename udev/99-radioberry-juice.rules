@@ -1,0 +1,21 @@
+# Radioberry Juice (FT2232H 0403:6010) — USB access for regular users
+#
+# The Radioberry Juice board is an FT2232H (VID:PID 0403:6010). Two things
+# are needed so the radioberry-juice gateway (libusb) can use it without
+# running as root:
+#
+#  1) permissions on the USB device node (/dev/bus/usb/...)
+#  2) freeing the interfaces from the kernel ftdi_sio serial driver
+#
+# Install:
+#   sudo cp 99-radioberry-juice.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (re-plug the board afterwards)
+
+# USB device node access for members of the plugdev group
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", MODE="0664", GROUP="plugdev"
+
+# Free the interfaces from the kernel ftdi_sio driver. This rule runs on
+# each *interface* add event — i.e. after the driver has bound — so it
+# cannot lose the race with ftdi_sio's probe at plug-in time.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", ATTR{driver}=="ftdi_sio", RUN+="/bin/sh -c 'echo -n $kernel > /sys/bus/usb/drivers/ftdi_sio/unbind 2>/dev/null'"

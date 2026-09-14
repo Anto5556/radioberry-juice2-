@@ -1,0 +1,23 @@
+# systemd *user* service for the Radioberry Juice gateway.
+# Installed by scripts/install.sh to ~/.config/systemd/user/.
+#
+#   systemctl --user status radioberry-juice.service
+#   tail -f ~/radioberry-juice/gateway/gateway.log
+
+[Unit]
+Description=Radioberry Juice gateway (HermesLite 2 / openHPSDR protocol-1)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/radioberry-juice/gateway
+ExecStart=%h/radioberry-juice/gateway/start-radioberry-juice.sh
+StandardOutput=append:%h/radioberry-juice/gateway/gateway.log
+StandardError=append:%h/radioberry-juice/gateway/gateway.log
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

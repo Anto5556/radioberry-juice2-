@@ -1,0 +1,157 @@
+diff --git a/juice/firmware-extended/gateware.c b/juice/firmware-extended/gateware.c
+index 1856b2a..1f504bf 100644
+--- a/juice/firmware-extended/gateware.c
++++ b/juice/firmware-extended/gateware.c
+@@ -2,12 +2,32 @@
+ 
+ FT_HANDLE ftHandle;
+ 
++/* Read the live pin levels of channel B. In async bit-bang mode the Linux
++ * D2XX FT_Read returns no pin samples, which left the status loops polling
++ * an uninitialised byte. */
++static int read_prog_pins(unsigned char *pins) {
++	return FT_GetBitMode(ftHandle, pins) == FT_OK ? 0 : -1;
++}
++
++/* When channel A is left in FT245 synchronous FIFO mode (a previous run of
++ * this program), the FT2232H disables channel B and every bit-bang write is
++ * silently ignored: the FPGA is never (re)programmed. Reset channel A first. */
++static void release_stream_channel() {
++	FT_HANDLE ftHandleA;
++	if (FT_OpenEx((void**)"radioberry-juice A", FT_OPEN_BY_DESCRIPTION, &ftHandleA) != FT_OK) return;
++	FT_SetBitMode(ftHandleA, 0, 0);
++	FT_Close(ftHandleA);
++	usleep(100000);
++}
++
+ int init_gateware_ftdi() {
+ 
+ 	printf("Init device for loading gateware...\r\n");
+ 
+ 	FT_STATUS ftStatus = FT_OK;
+ 
++	release_stream_channel();
++
+ 	ftStatus = FT_OpenEx((void**)"radioberry-juice B", FT_OPEN_BY_DESCRIPTION, &ftHandle);
+ 	
+ 	if (ftStatus == FT_OK)
+@@ -43,42 +63,39 @@ int init_gateware_upload() {
+ 
+ 	printf("Init FPGA gateware upload...\r\n");
+ 
+-	unsigned char outputBuffer[2];
+-	unsigned char inputBuffer[1];
++	unsigned char outputBuffer = 0x00;	// set progam pins 'low'.
++	unsigned char pins = 0;
+ 
+ 	DWORD numBytesSent = 0;
+-	DWORD numBytesRead = 0;
+ 
+-	outputBuffer[0] = 0x00;		// set progam pins 'low'.
+-	outputBuffer[1] = NCONFIG;	// set nconfig program pin 'high' 
+-
+-
+-	if (FT_Write(ftHandle, outputBuffer, 2, &numBytesSent) != FT_OK) {
++	if (FT_Write(ftHandle, &outputBuffer, 1, &numBytesSent) != FT_OK) {
+ 		printf("Init FPGA gateware upload write failed.\r\n");
+ 		return -1;
+ 	}
++	usleep(10000);	// nCONFIG low pulse; the FPGA needs well over 500 us.
+ 
+-	if (FT_Read(ftHandle, inputBuffer, 1, &numBytesRead) != FT_OK) {
+-		printf("Init FPGA gateware upload read failed.\r\n");
++	if (read_prog_pins(&pins) < 0 || (pins & NSTATUS)) {
++		printf("FPGA did not respond to nCONFIG (pins 0x%02x).\r\n", pins);
+ 		return -1;
+ 	}
+ 
+-	//printf("Total bytes read: %ld value: %x\n", numBytesRead, inputBuffer[0]);
+-
+-	while (!(inputBuffer[0] & NSTATUS)) {
++	outputBuffer = NCONFIG;	// set nconfig program pin 'high'
++	if (FT_Write(ftHandle, &outputBuffer, 1, &numBytesSent) != FT_OK) {
++		printf("Init FPGA gateware upload write failed.\r\n");
++		return -1;
++	}
+ 
+-		if (FT_Purge(ftHandle, FT_PURGE_RX) != FT_OK) {
+-			printf("Init FPGA gateware upload read failed (purge rx buffer).\r\n");
++	for (int wait = 0; ; wait++) {
++		usleep(10000);
++		if (read_prog_pins(&pins) < 0) {
++			printf("Init FPGA gateware upload read failed.\r\n");
+ 			return -1;
+ 		}
+-
+-		if (FT_Read(ftHandle, inputBuffer, 1, &numBytesRead) != FT_OK) {
+-			printf("Init FPGA gateware upload read failed.\r\n");
++		if (pins & NSTATUS) break;
++		if (wait >= 100) {
++			printf("FPGA nSTATUS stays low after nCONFIG (pins 0x%02x).\r\n", pins);
+ 			return -1;
+ 		}
+-		//printf("Total bytes read: %ld value: %x\n", numBytesRead, inputBuffer[0]);
+-
+-		usleep(1000000);
+ 	}
+ 
+ 	printf("FPGA ready to receive gateware.\r\n");
+@@ -196,36 +213,7 @@ int activate_gateware() {
+ 
+ 	printf("Activate FPGA gateware after upload...\r\n");
+ 
+-	unsigned char inputBuffer[1] ;
+-
+-	DWORD numBytesRead = 0;
+-
+-	if (FT_Purge(ftHandle, FT_PURGE_RX) != FT_OK) {
+-		printf("Activation gateware read failed (purge rx buffer).\r\n");
+-		return -1;
+-	}
+-
+-	if (FT_Read(ftHandle, inputBuffer, 1, &numBytesRead) != FT_OK) {
+-		printf("Activation gateware read failed.\r\n");
+-		return -1;
+-	}
+-
+-	while (!(inputBuffer[0] & NSTATUS) && !(inputBuffer[0] & NCONF_DONE) ) {
+-
+-		if (FT_Purge(ftHandle, FT_PURGE_RX) != FT_OK) {
+-			printf("Activation gateware read failed (purge rx buffer).\r\n");
+-			return -1;
+-		}
+-
+-		if (FT_Read(ftHandle, inputBuffer, 1, &numBytesRead) != FT_OK) {
+-			printf("Init FPGA gateware upload read failed.\r\n");
+-			return -1;
+-		}
+-
+-		printf("NSTATUS and NCONF_DONE must be low...\n");
+-
+-		usleep(1000);
+-	}
++	unsigned char pins = 0;
+ 
+ 	DWORD numBytesToSend = 0;
+ 	DWORD numBytesSent;
+@@ -253,6 +241,20 @@ int activate_gateware() {
+ 		return -1;
+ 	}
+ 
++	for (int wait = 0; ; wait++) {
++		usleep(10000);
++		if (read_prog_pins(&pins) < 0) {
++			printf("Activation gateware read failed.\r\n");
++			return -1;
++		}
++		if (pins & NCONF_DONE) break;
++		if (!(pins & NSTATUS) || wait >= 100) {
++			printf("FPGA rejected the gateware: CONF_DONE low (pins 0x%02x). "
++				   "Check that fpga= in radioberry.props matches the board.\r\n", pins);
++			return -1;
++		}
++	}
++
+ 	printf("FPGA gateware activated.\r\n");
+ 
+ 	return 0;

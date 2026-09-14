@@ -110,25 +110,56 @@ An earlier local workaround added timeouts that "continue". That turned a failed
 - waits for nSTATUS to rise;
 - after the upload, **requires CONF_DONE = 1** and otherwise stops with a clear message: `FPGA rejected the gateware ... Check that fpga= in radioberry.props matches the board`.
 
-### 4. After an unplug, the gateway never recovers (no waterfall until restarted)
+### 4. Unplug and replug: no waterfall until everything is restarted by hand
 
-When the Juice board is unplugged, or drops off USB because of a power dip, the gateway keeps its handle to the vanished device. When the board comes back it enumerates as a new USB device, but every `FT_Read`/`FT_Write` on the old handle fails at once:
+When the Juice board is unplugged, or drops off USB because of a power dip, it comes back as a **new** USB device. Four separate things went wrong:
 
-- the gateway never exits, so systemd never restarts it;
-- piHPSDR gets no IQ data, so there is no waterfall;
-- the gateway spins at 100 % CPU and floods its log with `us stream time out`. On the test PC that was 17 million lines, 327 MB, within minutes.
+| Problem | Effect |
+|---|---|
+| **a.** The gateway keeps its handle to the vanished device, and every `FT_Read`/`FT_Write` fails at once. | It never exits, spins at 100 % CPU and floods its log with `us stream time out`. On the test PC that was 17 million lines, 327 MB, within minutes. |
+| **b.** The gateway only touches USB while an SDR program is streaming. | An unplug while piHPSDR is closed goes completely unnoticed; the gateway sits on a dead handle. |
+| **c.** The old start script exits when no board is present, and the udev "start on plug-in" rule did not work reliably. | After an unplug of more than a few seconds nothing starts the gateway again. |
+| **d.** piHPSDR sends `Start` only once, when the radio is started. It goes silent when data stops. | Even a restarted gateway streams to nobody. The waterfall stays empty until the radio is restarted in piHPSDR. |
 
-**Fix:** `stream.c` now exits (code 2) as soon as D2XX reports the device is gone (`FT_DEVICE_NOT_FOUND`), or after 20 stream errors in a row. With `Restart=on-failure` the service restarts the gateway, the start script waits for the board, and the loader reloads and verifies the FPGA.
+**Fixes:**
 
-Tested by resetting the FT2232H with `USBDEVFS_RESET` in the middle of a stream:
+- **a. Exit on stream errors** ([`0002`](patches/0002-juice-stream-exit-on-usb-device-loss.patch), `stream.c`): the gateway exits with code 2 as soon as D2XX reports the device is gone (`FT_DEVICE_NOT_FOUND`), or after 20 stream errors in a row.
+- **b. Watch for an unplug even when idle** (same patch): a thread watches the board's sysfs entry (`/sys/bus/usb/devices/*`, `0403:6010`, product `radioberry-juice`) twice a second. If it disappears or changes device number, the gateway exits with code 2.
+- **c. Wait for the board** ([`scripts/start-radioberry-juice.sh`](scripts/start-radioberry-juice.sh)): the start script now waits until the board is plugged in, instead of exiting. With `Restart=on-failure`, systemd restarts the script after an exit, it waits for the board, and the loader reloads and verifies the FPGA. No udev rule is needed.
+- **d. Resume the stream** ([`0003`](patches/0003-juice-resume-stream-after-gateway-restart.patch), `radioberry.c`):
+  - On a UDP `Start`, the gateway saves the client's address in `last-client`, in the gateway directory. The file is refreshed every 2 s while streaming and removed on `Stop`.
+  - On startup, if that file is less than 5 minutes old, the gateway sends Start to the FPGA and resumes streaming to that client. piHPSDR's socket is still open, so its waterfall simply continues. piHPSDR's normal command traffic then restores frequency, gain and sample rate.
+  - If the client doesn't answer within 10 s (piHPSDR was closed), the gateway stops the stream again and removes the file.
+  - The resume path talks to the FPGA with `write_stream()`, not `write_rb_stream()`. The latter takes the external-amplifier semaphore, which is only initialised once the amplifier thread has run, and waiting on it at startup deadlocked the gateway.
 
-```
-us stream time out (status 2, 1 in a row)
-Radioberry Juice USB stream lost; exiting so the gateway can be restarted.
-...
-FPGA gateware activated.
-frames=3051 (381/s) gap_events=0 lost=0 loss=0.00% bad=0 seq_restarts=0
-```
+**Tests on the PC:**
+
+- **Stream errors:** a USB reset (`USBDEVFS_RESET`) in the middle of a stream.
+
+  ```
+  us stream time out (status 2, 1 in a row)
+  Radioberry Juice USB stream lost; exiting so the gateway can be restarted.
+  ...
+  FPGA gateware activated.
+  frames=3051 (381/s) gap_events=0 lost=0 loss=0.00% bad=0 seq_restarts=0
+  ```
+
+- **Resume:** gateway killed (`kill -9`) while `p1test.py` streamed, 3 rounds. The client never sent a new Start and kept receiving about 10 s later: 11,196–11,312 frames per 40 s run, no gaps apart from the restart.
+- **Client gone during the restart:** the gateway logged `No answer from the SDR program after resume; stopping the stream.` and removed the state file. A fresh client afterwards worked normally.
+- **Real cable pulls with piHPSDR:**
+
+  ```
+  # unplugged while piHPSDR was closed
+  Radioberry Juice USB device removed; exiting so the gateway can be restarted.
+  Waiting for the Radioberry Juice board (FT2232H 0403:6010) to be plugged in...
+  FPGA gateware activated.
+
+  # unplugged while piHPSDR was streaming — waterfall came back without touching piHPSDR
+  Radioberry Juice USB stream lost; exiting so the gateway can be restarted.
+  Waiting for the Radioberry Juice board (FT2232H 0403:6010) to be plugged in...
+  FPGA gateware activated.
+  Resuming IQ stream to 192.168.0.95:38756 after gateway restart.
+  ```
 
 **If the board keeps dropping off USB,** that is a power or cable problem, not software. The kernel log (`sudo journalctl -k`) then shows `usb_submit_urb returned -121` followed by `USB disconnect`, or `device descriptor read/64, error -32` on replug. This was seen on a battery-powered Raspberry Pi CM5 (uConsole) that shared its internal USB hub with other devices. Power the Juice board and Radioberry separately, or through a powered USB hub.
 
@@ -136,10 +167,11 @@ frames=3051 (381/s) gap_events=0 lost=0 loss=0.00% bad=0 seq_restarts=0
 
 ## The patches
 
-Both apply to [pa3gsb/Radioberry-2.x](https://github.com/pa3gsb/Radioberry-2.x) at commit `a9c5139` ("gateware selection added....", 2026-09-13):
+All three apply to [pa3gsb/Radioberry-2.x](https://github.com/pa3gsb/Radioberry-2.x) at commit `a9c5139` ("gateware selection added....", 2026-09-13). They were verified by building from a clean checkout:
 
 - [`patches/0001-juice-gateware-loader-linux-d2xx.patch`](patches/0001-juice-gateware-loader-linux-d2xx.patch) changes `juice/firmware-extended/gateware.c` and covers root causes 2 and 3.
-- [`patches/0002-juice-stream-exit-on-usb-device-loss.patch`](patches/0002-juice-stream-exit-on-usb-device-loss.patch) changes `juice/firmware-extended/stream.c` and covers root cause 4.
+- [`patches/0002-juice-stream-exit-on-usb-device-loss.patch`](patches/0002-juice-stream-exit-on-usb-device-loss.patch) changes `juice/firmware-extended/stream.c` and covers root causes 4a and 4b.
+- [`patches/0003-juice-resume-stream-after-gateway-restart.patch`](patches/0003-juice-resume-stream-after-gateway-restart.patch) changes `juice/firmware-extended/radioberry.c` and covers root cause 4d.
 
 Root cause 1 is fixed simply by using the official D2XX build instead of the shim.
 
@@ -156,7 +188,7 @@ bash scripts/install.sh CL025        # or CL016
 The installer does the following:
 
 1. Clones pa3gsb/Radioberry-2.x into `~/radioberry-juice/Radioberry-2.x` and checks out the tested commit.
-2. Applies the patch and builds `juice/firmware-extended` with `linux-Makefile`.
+2. Applies all patches in `patches/` and builds `juice/firmware-extended` with `linux-Makefile`.
 3. Installs the gateway, bundled `libftd2xx.so`, both gateware images and `radioberry.props` (`fpga=CL025`) into `~/radioberry-juice/gateway`.
 4. Installs and starts the user service [`systemd/radioberry-juice.service`](systemd/radioberry-juice.service). Any existing unit is backed up first.
 
@@ -213,7 +245,8 @@ python3 tools/p1_iqcapture.py --freq 7074000 /tmp/iq.npy
 
 - Start piHPSDR. The radio is discovered as **HermesLite V2** on `127.0.0.1` / your LAN IP, MAC `00:01:02:03:04:05`.
 - If the waterfall looked wrong before, check **Radio → RX gain calibration**. On the test machine it had been set to `-40`, apparently to hide the garbage. The piHPSDR default for HL2-type radios is `14`. The value is `rx_gain_calibration` in `00-01-02-03-04-05.props`.
-- After replugging the board, give the gateway about 15 s to reload the FPGA before starting piHPSDR.
+- **Unplug and replug is handled automatically.** If piHPSDR is running, its waterfall comes back by itself about 10–15 s after the board is plugged back in. If piHPSDR is closed, wait about 15 s after plugging in before starting it.
+- The service is a systemd **user** service, so it runs while you are logged in. To have it run at boot without logging in: `sudo loginctl enable-linger $USER`.
 
 ---
 
@@ -221,7 +254,7 @@ python3 tools/p1_iqcapture.py --freq 7074000 /tmp/iq.npy
 
 | File | Purpose |
 |---|---|
-| `tools/p1test.py` | protocol-1 client: discovery, start, count sequence gaps / bad frames, rough IQ level |
+| `tools/p1test.py` | protocol-1 client: discovery, start, count sequence gaps / bad frames / FPGA counter restarts, rough IQ level |
 | `tools/p1_iqcapture.py` | tuned IQ capture to `.npy` with loss, garbage and noise-floor statistics |
 | `tools/p1_rawdump.py` | hex dump of a raw 1032-byte frame (how the `32 60` status bytes were found) |
 | `tools/ftdi_syncbb_echo.c` | libftdi: sync bit-bang echo on channel A or B (shows channel B disabled) |

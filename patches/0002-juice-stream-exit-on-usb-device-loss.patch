@@ -1,8 +1,8 @@
 diff --git a/juice/firmware-extended/stream.c b/juice/firmware-extended/stream.c
-index babceed..b3c40e3 100644
+index babceed..20d6e5f 100644
 --- a/juice/firmware-extended/stream.c
 +++ b/juice/firmware-extended/stream.c
-@@ -3,6 +3,26 @@
+@@ -3,6 +3,91 @@
  
  FT_HANDLE ftHandleA;
  
@@ -26,10 +26,86 @@ index babceed..b3c40e3 100644
 +	}
 +}
 +
++#ifndef _WIN32
++#include <dirent.h>
++#include <pthread.h>
++
++/* The gateway only touches the stream while an SDR program is running, so an
++ * unplug while idle went unnoticed and the gateway kept a dead handle. Watch
++ * the board's sysfs entry instead: when the device disappears, or comes back
++ * with another device number, exit so the service restarts the gateway. */
++static char usb_dir[300];
++static char usb_devnum[16];
++
++static int read_attr(const char *dir, const char *attr, char *out, size_t size) {
++	char path[400];
++	snprintf(path, sizeof(path), "%s/%s", dir, attr);
++	FILE *f = fopen(path, "r");
++	if (!f) return -1;
++	if (!fgets(out, (int)size, f)) { fclose(f); return -1; }
++	fclose(f);
++	out[strcspn(out, "\r\n")] = 0;
++	return 0;
++}
++
++static int find_juice_usb() {
++	DIR *d = opendir("/sys/bus/usb/devices");
++	struct dirent *e;
++	char vid[8], pid[8], product[64], dir[300];
++	if (!d) return -1;
++	while ((e = readdir(d)) != NULL) {
++		if (e->d_name[0] == '.' || strchr(e->d_name, ':')) continue;
++		snprintf(dir, sizeof(dir), "/sys/bus/usb/devices/%s", e->d_name);
++		if (read_attr(dir, "idVendor", vid, sizeof(vid)) || strcmp(vid, "0403")) continue;
++		if (read_attr(dir, "idProduct", pid, sizeof(pid)) || strcmp(pid, "6010")) continue;
++		if (read_attr(dir, "product", product, sizeof(product)) || strcmp(product, "radioberry-juice")) continue;
++		if (read_attr(dir, "devnum", usb_devnum, sizeof(usb_devnum))) continue;
++		snprintf(usb_dir, sizeof(usb_dir), "%s", dir);
++		closedir(d);
++		return 0;
++	}
++	closedir(d);
++	return -1;
++}
++
++static void *usb_presence_thread(void *arg) {
++	char devnum[16];
++	(void)arg;
++	for (;;) {
++		usleep(500000);
++		if (read_attr(usb_dir, "devnum", devnum, sizeof(devnum)) || strcmp(devnum, usb_devnum)) {
++			fprintf(stderr, "Radioberry Juice USB device removed; exiting so the gateway can be restarted.\n");
++			exit(2);
++		}
++	}
++	return NULL;
++}
++
++static void start_usb_presence_monitor() {
++	pthread_t pid;
++	if (find_juice_usb() < 0) {
++		fprintf(stderr, "Radioberry Juice USB device not found in sysfs; unplug detection disabled.\n");
++		return;
++	}
++	pthread_create(&pid, NULL, usb_presence_thread, NULL);
++}
++#endif
++
  int init_stream() {
  
  	printf("Init device for iq stream handling...\r\n");
-@@ -71,10 +91,11 @@ int write_stream(unsigned char stream[]){
+@@ -35,6 +120,10 @@ int init_stream() {
+ 
+ 	printf("Init device succeeded for iq streaming using FT245 protocol.\r\n");
+ 
++#ifndef _WIN32
++	start_usb_presence_monitor();
++#endif
++
+ 	return 0;
+ };
+ 
+@@ -71,10 +160,11 @@ int write_stream(unsigned char stream[]){
  			fprintf(stderr, "ds stream time not complete; only %d bytes sent \n", numBytesSent);
  			return -1;
  		}
@@ -42,7 +118,7 @@ index babceed..b3c40e3 100644
  	}
  
  	return 0;
-@@ -97,11 +118,12 @@ int read_stream(unsigned char stream[]) {
+@@ -97,11 +187,12 @@ int read_stream(unsigned char stream[]) {
  		if (1032 != BytesReceived) {
  			fprintf(stderr, "us stream read not complete \n");
  			return -1;

@@ -1,0 +1,161 @@
+diff --git a/juice/firmware-extended/radioberry.c b/juice/firmware-extended/radioberry.c
+index c80476f..b9ea472 100644
+--- a/juice/firmware-extended/radioberry.c
++++ b/juice/firmware-extended/radioberry.c
+@@ -49,6 +49,7 @@ For more information, please refer to <http://unlicense.org/>
+ */
+ 
+ #include "radioberry.h"
++#include <time.h>
+ #include "gateware.h"
+ #include "stream.h"
+ #include "register.h"
+@@ -165,8 +166,99 @@ uint16_t recalculateADCValue(uint16_t adc_in) {
+ 	return pa_dac;
+ }
+ 
++/* Resume after a restart.
++ * piHPSDR sends Start only once. When the gateway restarts (e.g. the board was
++ * unplugged and plugged back in) piHPSDR keeps waiting for IQ data and never
++ * sends Start again, so there is no waterfall until the radio is restarted in
++ * piHPSDR. The UDP client of the running stream is kept in a small state file
++ * (refreshed while streaming, removed on Stop). On startup a recent state file
++ * resumes the stream to that client; if the client does not answer within
++ * RB_RESUME_WAIT seconds (piHPSDR was closed) the stream is stopped again. */
++#ifndef _WIN32
++#define RB_CLIENT_STATE   "last-client"
++#define RB_RESUME_MAX_AGE 300
++#define RB_RESUME_WAIT    10
++
++static volatile time_t last_udp_rx = 0;
++static time_t resumed_at = 0;
++
++static void save_client_state() {
++	FILE *f;
++	if (sock_TCP_Client >= 0) return;
++	f = fopen(RB_CLIENT_STATE ".tmp", "w");
++	if (!f) return;
++	fprintf(f, "%s %d\n", inet_ntoa(remaddr.sin_addr), ntohs(remaddr.sin_port));
++	fclose(f);
++	rename(RB_CLIENT_STATE ".tmp", RB_CLIENT_STATE);
++}
++
++static void refresh_client_state() {
++	static time_t last_refresh = 0;
++	time_t now = time(NULL);
++	if (sock_TCP_Client >= 0 || now - last_refresh < 2) return;
++	last_refresh = now;
++	utimes(RB_CLIENT_STATE, NULL);
++}
++
++static void clear_client_state() {
++	unlink(RB_CLIENT_STATE);
++}
++
++static void send_start_stop_to_fpga(unsigned char command) {
++	unsigned char packet[1032];
++	memset(packet, 0, sizeof(packet));
++	packet[0] = 0xEF; packet[1] = 0xFE; packet[2] = 0x04; packet[3] = command;
++	/* Not write_rb_stream(): its amplifier semaphore is initialised by the PA
++	 * thread, which may not have run yet at startup (sem_wait would block). */
++	write_stream(packet);
++}
++
++static void *resume_watchdog_thread(void *arg) {
++	(void)arg;
++	sleep(RB_RESUME_WAIT);
++	if (running && last_udp_rx < resumed_at) {
++		fprintf(stderr, "No answer from the SDR program after resume; stopping the stream.\n");
++		running = 0;
++		while (active) usleep(1000);
++		send_start_stop_to_fpga(0x00);
++		clear_client_state();
++	}
++	return NULL;
++}
++
++static void resume_client_stream() {
++	struct stat st;
++	char ip[64];
++	int port;
++	pthread_t pid;
++	FILE *f;
++
++	if (stat(RB_CLIENT_STATE, &st) != 0) return;
++	if (time(NULL) - st.st_mtime > RB_RESUME_MAX_AGE) { clear_client_state(); return; }
++	f = fopen(RB_CLIENT_STATE, "r");
++	if (!f) return;
++	if (fscanf(f, "%63s %d", ip, &port) != 2 || port <= 0 || port > 65535) { fclose(f); clear_client_state(); return; }
++	fclose(f);
++
++	memset(&remaddr, 0, sizeof(remaddr));
++	remaddr.sin_family = AF_INET;
++	remaddr.sin_port = htons(port);
++	if (inet_aton(ip, &remaddr.sin_addr) == 0) { clear_client_state(); return; }
++
++	fprintf(stderr, "Resuming IQ stream to %s:%d after gateway restart.\n", ip, port);
++	resumed_at = time(NULL);
++	send_start_stop_to_fpga(0x01);
++	running = 1;
++	pthread_create(&pid, NULL, resume_watchdog_thread, NULL);
++}
++#endif
++
+ void getStreamAndSendPacket() {
+-	
++
++#ifndef _WIN32
++	refresh_client_state();
++#endif
++
+ 	if (read_stream(hpsdrdata) < 0) return; // fetching 1032 bytes of ethernet packet.
+ 	// the sdr data coming from the radioberry need to be enhanced with adddional information.
+ 	if (isAmplifierConnected()) {
+@@ -264,7 +356,13 @@ void *packetreader(void *arg) {
+ 		else {
+ 			// handle UDP protocol.
+ 			int recvlen = recvfrom(fd, (char*) buffer, sizeof(buffer), 0, (struct sockaddr *)&remaddr, &addrlen);
+-			if (recvlen > 0) { udp_retries = 0; handlePacket((unsigned char*) buffer); } else udp_retries++;
++			if (recvlen > 0) {
++				udp_retries = 0;
++#ifndef _WIN32
++				last_udp_rx = time(NULL);
++#endif
++				handlePacket((unsigned char*) buffer);
++			} else udp_retries++;
+ 			// If nothing has arrived via UDP for some time (defined by socket timeout * 10) , try to open TCP connection.
+ 			if (sock_TCP_Client < 0 && udp_retries > 10)
+ 			{
+@@ -309,6 +407,9 @@ void handlePacket(unsigned char* buffer){
+ 			fprintf(stderr, "SDR Program sends Stop command \n");
+ 			running = 0;
+ 			while (active) usleep(1000);
++#ifndef _WIN32
++			clear_client_state();
++#endif
+ 			if (sock_TCP_Client > -1)
+ 			{
+ 				close(sock_TCP_Client);
+@@ -322,6 +423,9 @@ void handlePacket(unsigned char* buffer){
+ 		case 0x0304feef:
+ 			{
+ 			fprintf(stderr, "Start Port %d \n", ntohs(remaddr.sin_port));
++#ifndef _WIN32
++			save_client_state();
++#endif
+ 			running = 1;
+ 			if (sock_TCP_Client > -1)
+ 				fprintf(stderr, "SDR Program sends TCP Start command \n");
+@@ -574,7 +678,11 @@ int main(int argc, char **argv)
+ 	start_rb_pa_thread();
+ 	
+ 	signal(SIGINT, handle_sigint);
+-	
++
++#ifndef _WIN32
++	resume_client_stream();
++#endif
++
+ 	runRadioberry();
+ 	
+ 	closeRadioberry();

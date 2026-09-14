@@ -41,7 +41,7 @@ The FPGA has no config flash of its own. The gateway uploads `radioberry.rbf` th
 
 ---
 
-## Root causes (three separate bugs)
+## Root causes (four separate bugs)
 
 ### 1. The libusb "ftd2xx shim" corrupted the IQ stream
 
@@ -110,11 +110,38 @@ An earlier local workaround added timeouts that "continue". That turned a failed
 - waits for nSTATUS to rise;
 - after the upload, **requires CONF_DONE = 1** and otherwise stops with a clear message: `FPGA rejected the gateware ... Check that fpga= in radioberry.props matches the board`.
 
+### 4. After an unplug, the gateway never recovers (no waterfall until restarted)
+
+When the Juice board is unplugged, or drops off USB because of a power dip, the gateway keeps its handle to the vanished device. When the board comes back it enumerates as a new USB device, but every `FT_Read`/`FT_Write` on the old handle fails at once:
+
+- the gateway never exits, so systemd never restarts it;
+- piHPSDR gets no IQ data, so there is no waterfall;
+- the gateway spins at 100 % CPU and floods its log with `us stream time out`. On the test PC that was 17 million lines, 327 MB, within minutes.
+
+**Fix:** `stream.c` now exits (code 2) as soon as D2XX reports the device is gone (`FT_DEVICE_NOT_FOUND`), or after 20 stream errors in a row. With `Restart=on-failure` the service restarts the gateway, the start script waits for the board, and the loader reloads and verifies the FPGA.
+
+Tested by resetting the FT2232H with `USBDEVFS_RESET` in the middle of a stream:
+
+```
+us stream time out (status 2, 1 in a row)
+Radioberry Juice USB stream lost; exiting so the gateway can be restarted.
+...
+FPGA gateware activated.
+frames=3051 (381/s) gap_events=0 lost=0 loss=0.00% bad=0 seq_restarts=0
+```
+
+**If the board keeps dropping off USB,** that is a power or cable problem, not software. The kernel log (`sudo journalctl -k`) then shows `usb_submit_urb returned -121` followed by `USB disconnect`, or `device descriptor read/64, error -32` on replug. This was seen on a battery-powered Raspberry Pi CM5 (uConsole) that shared its internal USB hub with other devices. Power the Juice board and Radioberry separately, or through a powered USB hub.
+
 ---
 
-## The patch
+## The patches
 
-[`patches/0001-juice-gateware-loader-linux-d2xx.patch`](patches/0001-juice-gateware-loader-linux-d2xx.patch) applies to `juice/firmware-extended/gateware.c` of [pa3gsb/Radioberry-2.x](https://github.com/pa3gsb/Radioberry-2.x) at commit `a9c5139` ("gateware selection added....", 2026-09-13). It covers root causes 2 and 3. Root cause 1 is fixed simply by using the official D2XX build instead of the shim.
+Both apply to [pa3gsb/Radioberry-2.x](https://github.com/pa3gsb/Radioberry-2.x) at commit `a9c5139` ("gateware selection added....", 2026-09-13):
+
+- [`patches/0001-juice-gateware-loader-linux-d2xx.patch`](patches/0001-juice-gateware-loader-linux-d2xx.patch) changes `juice/firmware-extended/gateware.c` and covers root causes 2 and 3.
+- [`patches/0002-juice-stream-exit-on-usb-device-loss.patch`](patches/0002-juice-stream-exit-on-usb-device-loss.patch) changes `juice/firmware-extended/stream.c` and covers root cause 4.
+
+Root cause 1 is fixed simply by using the official D2XX build instead of the shim.
 
 ## Install
 

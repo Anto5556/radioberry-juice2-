@@ -1,0 +1,59 @@
+diff --git a/juice/firmware-extended/stream.c b/juice/firmware-extended/stream.c
+index babceed..b3c40e3 100644
+--- a/juice/firmware-extended/stream.c
++++ b/juice/firmware-extended/stream.c
+@@ -3,6 +3,26 @@
+ 
+ FT_HANDLE ftHandleA;
+ 
++#define RB_MAX_STREAM_ERRORS 20
++
++static int stream_errors = 0;
++
++/* After the Juice board is unplugged (or drops off USB) the handle never
++ * recovers: every FT_Read/FT_Write fails at once, the gateway spins at full
++ * CPU and floods the log. Exit instead, so systemd restarts the gateway and
++ * the gateware is reloaded once the board is back. */
++static void stream_error(const char *what, FT_STATUS status) {
++	DWORD queued = 0;
++	stream_errors++;
++	if (stream_errors == 1 || stream_errors % 1000 == 0)
++		fprintf(stderr, "%s (status %d, %d in a row)\n", what, (int)status, stream_errors);
++	if (status == FT_DEVICE_NOT_FOUND || FT_GetQueueStatus(ftHandleA, &queued) != FT_OK ||
++			stream_errors >= RB_MAX_STREAM_ERRORS) {
++		fprintf(stderr, "Radioberry Juice USB stream lost; exiting so the gateway can be restarted.\n");
++		exit(2);
++	}
++}
++
+ int init_stream() {
+ 
+ 	printf("Init device for iq stream handling...\r\n");
+@@ -71,10 +91,11 @@ int write_stream(unsigned char stream[]){
+ 			fprintf(stderr, "ds stream time not complete; only %d bytes sent \n", numBytesSent);
+ 			return -1;
+ 		}
++		stream_errors = 0;
+ 	}
+ 	else
+ 	{
+-		fprintf(stderr, "ds stream time out \n");
++		stream_error("ds stream time out", ftStatus);
+ 	}
+ 
+ 	return 0;
+@@ -97,11 +118,12 @@ int read_stream(unsigned char stream[]) {
+ 		if (1032 != BytesReceived) {
+ 			fprintf(stderr, "us stream read not complete \n");
+ 			return -1;
+-		} 
++		}
++		stream_errors = 0;
+ 	}
+ 	else
+ 	{
+-		fprintf(stderr, "us stream time out \n");
++		stream_error("us stream time out", ftStatus);
+ 		return -2;
+ 	}
+ 	

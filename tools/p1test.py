@@ -6,6 +6,7 @@ HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 SECS = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
 SPEED = int(sys.argv[3]) if len(sys.argv) > 3 else 0  # 0=48k 1=96k 2=192k 3=384k
 PORT = 1024
+IQ_EVERY = 1 << SPEED  # IQ stats on every Nth frame
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -29,7 +30,7 @@ def ep2_frame(seq, c0, c1, c2, c3, c4):
 s.sendto(ep2_frame(0, 0x00, SPEED, 0, 0, 0x04), (HOST, PORT))
 s.sendto(bytes([0xEF, 0xFE, 0x04, 0x01]) + bytes(60), (HOST, PORT))
 
-last = None; frames = gaps = lost = bad = 0
+last = None; frames = gaps = lost = bad = restarts = 0
 sumsq = 0.0; n = 0; peak = 0; tx_seq = 1
 t0 = time.time(); next_ep2 = t0
 try:
@@ -46,8 +47,13 @@ try:
             bad += 1; continue
         seq = struct.unpack(">I", d[4:8])[0]
         if last is not None and seq != (last + 1) & 0xFFFFFFFF:
-            gaps += 1; lost += (seq - last - 1) & 0xFFFFFFFF
+            if seq <= last or seq - last > 100000:
+                restarts += 1  # FPGA counter restarted (stale frames from a previous run)
+            else:
+                gaps += 1; lost += seq - last - 1
         last = seq; frames += 1
+        if frames % IQ_EVERY:
+            continue  # sample IQ stats on a subset so Python keeps up at high rates
         for base in (8, 520):
             if d[base:base+3] != b"\x7f\x7f\x7f":
                 bad += 1; continue
@@ -62,7 +68,7 @@ finally:
 
 el = time.time() - t0
 print(f"frames={frames} ({frames/el:.0f}/s) gap_events={gaps} lost={lost} "
-      f"loss={100*lost/max(1,frames+lost):.2f}% bad={bad}")
+      f"loss={100*lost/max(1,frames+lost):.2f}% bad={bad} seq_restarts={restarts}")
 if n:
     rms = math.sqrt(sumsq / n)
     print(f"IQ rms={rms:.0f} ({20*math.log10(max(rms,1)/8388607):.1f} dBFS) "

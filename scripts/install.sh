@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and install the Radioberry Juice gateway on an x86_64/arm Linux PC:
 #   - fetches pa3gsb/Radioberry-2.x (juice/firmware-extended, official FTDI D2XX build)
-#   - applies patches/0001-juice-gateware-loader-linux-d2xx.patch
+#   - applies patches/*.patch (gateware loader fix, exit on USB device loss)
 #   - installs to ~/radioberry-juice/gateway with fpga=CL016|CL025
 #   - installs and starts a systemd *user* service
 #
@@ -25,14 +25,16 @@ git -C "$SRC" fetch --depth=50 origin "$UPSTREAM_COMMIT" 2>/dev/null || true
 git -C "$SRC" checkout -q "$UPSTREAM_COMMIT" -- juice/firmware-extended
 
 cd "$SRC"
-if git apply --check "$HERE/patches/0001-juice-gateware-loader-linux-d2xx.patch" 2>/dev/null; then
-    git apply "$HERE/patches/0001-juice-gateware-loader-linux-d2xx.patch"
-    echo "patch applied"
-elif git apply --reverse --check "$HERE/patches/0001-juice-gateware-loader-linux-d2xx.patch" 2>/dev/null; then
-    echo "patch already applied"
-else
-    echo "patch does not apply to this upstream version" >&2; exit 1
-fi
+for p in "$HERE"/patches/*.patch; do
+    if git apply --check "$p" 2>/dev/null; then
+        git apply "$p"
+        echo "applied $(basename "$p")"
+    elif git apply --reverse --check "$p" 2>/dev/null; then
+        echo "already applied $(basename "$p")"
+    else
+        echo "$(basename "$p") does not apply to this upstream version" >&2; exit 1
+    fi
+done
 
 cd "$SRC/juice/firmware-extended"
 make -f linux-Makefile -j"$(nproc)"
